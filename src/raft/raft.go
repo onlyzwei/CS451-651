@@ -1,35 +1,38 @@
 package raft
 
-//
+import (
+	"labrpc"
+	"sync"
+	"time"
+	//"bytes"
+	//"encoding/gob"
+)
+
 // this is an outline of the API that raft must expose to
 // the service (or tester). see comments below for
 // each of these functions for more details.
 //
 // rf = Make(...)
-//   create a new Raft server.
-// rf.Start(command interface{}) (index, term, isleader)
-//   start agreement on a new log entry
-// rf.GetState() (term, isLeader)
-//   ask a Raft for its current term, and whether it thinks it is leader
-// ApplyMsg
-//   each time a new entry is committed to the log, each Raft peer
-//   should send an ApplyMsg to the service (or tester)
-//   in the same server.
 //
-
-import "sync"
-import "labrpc"
-
-// import "bytes"
-// import "encoding/gob"
-
-
-
+//	create a new Raft server.
+//
+// rf.Start(command interface{}) (index, term, isleader)
+//
+//	start agreement on a new log entry
+//
+// rf.GetState() (term, isLeader)
+//
+//	ask a Raft for its current term, and whether it thinks it is leader
+//
+// ApplyMsg
+//
+//	each time a new entry is committed to the log, each Raft peer
+//	should send an ApplyMsg to the service (or tester)
+//	in the same server.
 //
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make().
-//
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
@@ -37,18 +40,43 @@ type ApplyMsg struct {
 	Snapshot    []byte // ignore for lab2; only used in lab3
 }
 
-//
-// A Go object implementing a single Raft peer.
-//
-type Raft struct {
-	mu        sync.Mutex          // Lock to protect shared access to this peer's state
-	peers     []*labrpc.ClientEnd // RPC end points of all peers
-	persister *Persister          // Object to hold this peer's persisted state
-	me        int                 // this peer's index into peers[]
+// Constantes para os estados do servidor
+const (
+	StateFollower = iota
+	StateCandidate
+	StateLeader
+)
 
-	// Your data here (2A, 2B, 2C).
-	// Look at the paper's Figure 2 for a description of what
-	// state a Raft server must maintain.
+// Estrutura da log entry
+type LogEntry struct {
+	Term    int
+	Command interface{}
+}
+
+// A Go object implementing a single Raft peer.
+type Raft struct {
+	mu        sync.Mutex          // Mutex para proteger o acesso concorrente a este estado
+	peers     []*labrpc.ClientEnd // Conexoes RPC para todos os servidores
+	persister *Persister          // Objeto para armazenar e ler o estado persistente
+	me        int                 // Indice deste servidor em peers[]
+	dead      int32               // set by Kill()
+
+	// Estado Persistente 	(em todos os servidores)
+	CurrentTerm int
+	VotedFor    int
+	Log         []LogEntry
+
+	// Estado Volatil 		(em todos os servidores)
+	CommitIndex int
+	LastApplied int
+
+	// Estado Volatil		(apenas lideres)
+	NextIndex  []int
+	MatchIndex []int
+
+	// Estado Interno (nao esta na figura 2, mas eh necessario)
+	State         int         // (Follower, Candidate, Leader)
+	ElectionTimer *time.Timer // Timer que dispara a eleicao
 
 }
 
@@ -62,11 +90,9 @@ func (rf *Raft) GetState() (int, bool) {
 	return term, isleader
 }
 
-//
 // save Raft's persistent state to stable storage,
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
-//
 func (rf *Raft) persist() {
 	// Your code here (2C).
 	// Example:
@@ -78,9 +104,7 @@ func (rf *Raft) persist() {
 	// rf.persister.SaveRaftState(data)
 }
 
-//
 // restore previously persisted state.
-//
 func (rf *Raft) readPersist(data []byte) {
 	// Your code here (2C).
 	// Example:
@@ -93,33 +117,41 @@ func (rf *Raft) readPersist(data []byte) {
 	}
 }
 
-
-
-
-//
-// example RequestVote RPC arguments structure.
-// field names must start with capital letters!
-//
 type RequestVoteArgs struct {
-	// Your data here (2A, 2B).
+	Term         int // Termo do candidato
+	CandidateId  int // ID do cand. que solicitou o voto
+	LastLogIndex int // Indice da ultima LogEntry do candidato
+	LastLogTerm  int // Termo da ultima LogEntry do candidato
 }
 
-//
-// example RequestVote RPC reply structure.
-// field names must start with capital letters!
-//
 type RequestVoteReply struct {
-	// Your data here (2A).
+	Term        int  // Termo atual do recipiente (para o candidato se atualizar)
+	VoteGranted bool // Se true, então o candidato recebeu o voto
 }
 
-//
-// example RequestVote RPC handler.
-//
+type AppendEntriesArgs struct {
+	Term         int        // Termo do lider
+	LeaderId     int        // ID do leader (para o seguidor redirecionar clientes)
+	PrevLogIndex int        // Indice da LogEntry imediatamente anterior as novas
+	PrevLogTerm  int        // Termo da entrada PrevLogIndex
+	Entries      []LogEntry // Entradas de log (vazio para heartbeat)
+	LeaderCommit int        // Indice de "commit" do lider
+
+}
+
+type AppendEntriesReply struct {
+	Term    int  // Termo atual (para o lider se atualizar)
+	Success bool // Se true, entao o seguidor contem a entrada PrevLogIndex/PrevLogTerm
+}
+
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 }
 
-//
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -147,14 +179,11 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // capitalized all field names in structs passed over RPC, and
 // that the caller passes the address of the reply struct with &, not
 // the struct itself.
-//
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
 
-
-//
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
 // server isn't the leader, returns false. otherwise start the
@@ -166,7 +195,6 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // if it's ever committed. the second return value is the current
 // term. the third return value is true if this server believes it is
 // the leader.
-//
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
 	term := -1
@@ -174,21 +202,17 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	// Your code here (2B).
 
-
 	return index, term, isLeader
 }
 
-//
 // the tester calls Kill() when a Raft instance won't
 // be needed again. you are not required to do anything
 // in Kill(), but it might be convenient to (for example)
 // turn off debug output from this instance.
-//
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 }
 
-//
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -198,19 +222,23 @@ func (rf *Raft) Kill() {
 // tester or service expects Raft to send ApplyMsg messages.
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
-//
-func Make(peers []*labrpc.ClientEnd, me int,
-	persister *Persister, applyCh chan ApplyMsg) *Raft {
+func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
 	rf.me = me
 
-	// Your initialization code here (2A, 2B, 2C).
+	rf.CurrentTerm = 0
+	rf.VotedFor = -1             // -1 indica "nulo" (nenhum voto concedido)
+	rf.Log = make([]LogEntry, 1) // O log começa com índice 1. O índice 0 é um sentinela.
+
+	rf.CommitIndex = 0
+	rf.LastApplied = 0
+
+	rf.State = StateFollower // Todo servidor começa como Follower
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
-
 
 	return rf
 }
