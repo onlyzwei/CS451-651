@@ -2,10 +2,10 @@ package raft
 
 import (
 	"labrpc"
+	"math/rand"
 	"sync"
+	"sync/atomic"
 	"time"
-	//"bytes"
-	//"encoding/gob"
 )
 
 // this is an outline of the API that raft must expose to
@@ -33,6 +33,7 @@ import (
 // as each Raft peer becomes aware that successive log entries are
 // committed, the peer should send an ApplyMsg to the service (or
 // tester) on the same server, via the applyCh passed to Make().
+
 type ApplyMsg struct {
 	Index       int
 	Command     interface{}
@@ -47,7 +48,14 @@ const (
 	StateLeader
 )
 
-// Estrutura da log entry
+// Constantes de tempo
+const (
+	ElectionTimeoutMin = 300 * time.Millisecond
+	ElectionTimeoutMax = 600 * time.Millisecond
+	HeartbeatInterval  = 100 * time.Millisecond
+)
+
+// Estrutura da LogEntry
 type LogEntry struct {
 	Term    int
 	Command interface{}
@@ -83,10 +91,10 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-
-	var term int
-	var isleader bool
-	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	term := rf.CurrentTerm
+	isleader := rf.State == StateLeader
 	return term, isleader
 }
 
@@ -152,6 +160,27 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 }
 
+// Gera timeout aleatório no intervalo [min, max).
+func randElectionTimeout() time.Duration {
+	d := ElectionTimeoutMax - ElectionTimeoutMin
+	return ElectionTimeoutMin + time.Duration(rand.Int63n(int64(d)))
+}
+
+// Deve ser chamada com rf.mu travado.
+func (rf *Raft) resetElectionTimerLocked() {
+	if rf.ElectionTimer == nil {
+		rf.ElectionTimer = time.NewTimer(randElectionTimeout())
+		return
+	}
+	if !rf.ElectionTimer.Stop() {
+		select {
+		case <-rf.ElectionTimer.C:
+		default:
+		}
+	}
+	rf.ElectionTimer.Reset(randElectionTimeout())
+}
+
 // example code to send a RequestVote RPC to a server.
 // server is the index of the target server in rf.peers[].
 // expects RPC arguments in args.
@@ -205,12 +234,61 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	return index, term, isLeader
 }
 
-// the tester calls Kill() when a Raft instance won't
-// be needed again. you are not required to do anything
-// in Kill(), but it might be convenient to (for example)
-// turn off debug output from this instance.
+// Kill sinaliza que este servidor Raft não será mais usado.
+// Define o flag `dead` e força o timer a disparar imediatamente,
+// permitindo que loops como electionLoop() saiam de forma limpa.
 func (rf *Raft) Kill() {
-	// Your code here, if desired.
+	// Marca este servidor como "morto".
+	atomic.StoreInt32(&rf.dead, 1)
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if rf.ElectionTimer != nil {
+		// Para o timer. Se ele já tiver disparado, drena o canal.
+		if !rf.ElectionTimer.Stop() {
+			select {
+			case <-rf.ElectionTimer.C: // Drena o canal se necessário.
+			default:
+			}
+		}
+
+		// Reseta o timer para 0, o que faz ele disparar imediatamente.
+		// Isso acorda o electionLoop() caso ele esteja bloqueado em `<-rf.ElectionTimer.C`.
+		rf.ElectionTimer.Reset(0)
+	}
+}
+
+// electionLoop roda em background e é responsável por controlar o timer de eleição.
+// Quando o timer expira, o servidor (se não for líder) se torna candidato e inicia um novo termo.
+// Essa função roda até que o servidor seja "morto" com Kill().
+func (rf *Raft) electionLoop() {
+	// Inicializa o timer de eleição com um valor aleatório entre ElectionTimeoutMin e ElectionTimeoutMax.
+	rf.mu.Lock()
+	rf.resetElectionTimerLocked()
+	rf.mu.Unlock()
+
+	for {
+		// Espera o timer expirar. Essa linha BLOQUEIA até que o timer dispare.
+		<-rf.ElectionTimer.C
+
+		// Verifica se o servidor foi "morto" (Kill() chamado). Se sim, encerra a goroutine.
+		if atomic.LoadInt32(&rf.dead) == 1 {
+			return
+		}
+
+		// Caso o servidor ainda esteja ativo, verifica seu estado.
+		rf.mu.Lock()
+		if rf.State != StateLeader {
+			// Se não for líder, inicia o processo de eleição (por enquanto só muda o estado e termo).
+			rf.State = StateCandidate
+			rf.CurrentTerm++
+		}
+
+		// Reinicia o timer de eleição com um novo valor aleatório.
+		rf.resetElectionTimerLocked()
+		rf.mu.Unlock()
+	}
 }
 
 // the service or tester wants to create a Raft server. the ports
@@ -223,6 +301,8 @@ func (rf *Raft) Kill() {
 // Make() must return quickly, so it should start goroutines
 // for any long-running work.
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
+	rand.Seed(time.Now().UnixNano())
+
 	rf := &Raft{}
 	rf.peers = peers
 	rf.persister = persister
@@ -239,6 +319,8 @@ func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan 
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
+
+	go rf.electionLoop() // Inicia o loop de eleição
 
 	return rf
 }
