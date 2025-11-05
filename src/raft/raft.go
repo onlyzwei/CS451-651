@@ -197,6 +197,7 @@ func (rf *Raft) resetElectionTimerLocked() {
 
 // Laço principal: controla tempo de eleição. Ao expirar, inicia uma eleição.
 // Também dispara e mantém heartbeats quando torna-se líder.
+// Laço principal: controla tempo de eleição. Ao expirar, inicia uma eleição.
 func (rf *Raft) electionLoop() {
 	rf.mu.Lock()
 	rf.resetElectionTimerLocked()
@@ -209,8 +210,11 @@ func (rf *Raft) electionLoop() {
 		}
 
 		rf.mu.Lock()
-		// Sempre dispara eleição no timeout.
-		rf.startElectionLocked()
+		// CORREÇÃO CRÍTICA: Se já for líder, NÃO inicia nova eleição.
+		// Apenas reagenda o timer para manter o ciclo vivo caso deixe de ser líder.
+		if rf.State != StateLeader {
+			rf.startElectionLocked()
+		}
 		rf.resetElectionTimerLocked()
 		rf.mu.Unlock()
 	}
