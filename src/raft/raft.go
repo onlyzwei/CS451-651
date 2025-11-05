@@ -8,6 +8,8 @@ import (
 	"time"
 )
 
+var seedOnce sync.Once // Garante que a semente aleatória seja inicializada apenas uma vez.
+
 // Mensagem entregue ao serviço quando entradas são aplicadas (não usado em 2A).
 type ApplyMsg struct {
 	Index       int
@@ -23,11 +25,12 @@ const (
 	StateLeader
 )
 
-// Temporizações. Heartbeat <= 10/s
+// Temporizações.
 const (
-	ElectionTimeoutMin = 300 * time.Millisecond
-	ElectionTimeoutMax = 600 * time.Millisecond
-	HeartbeatInterval  = 100 * time.Millisecond
+	// Aumente estes valores para evitar eleições desnecessárias em máquinas mais lentas
+	ElectionTimeoutMin = 400 * time.Millisecond
+	ElectionTimeoutMax = 800 * time.Millisecond
+	HeartbeatInterval  = 100 * time.Millisecond // Mantido em 10 req/s
 )
 
 // Entrada de log (em 2A o conteúdo não é usado, mas precisamos do termo).
@@ -104,28 +107,28 @@ type AppendEntriesReply struct {
 // Implementação de RequestVote, incluindo atualização de termo e regra de “log atualizado”.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	rf.mu.Lock()
-	defer rf.mu.Unlock() // Garante que o mutex será liberado no retorno da func.
+	defer rf.mu.Unlock()
 
-	reply.Term = rf.CurrentTerm // meu termo atual
-	reply.VoteGranted = false   // padrão: nega voto
-
-	// 1) Se o termo do candidato é menor, recusa.
+	// 1) Se o termo do candidato é menor, recusa imediatamente.
 	if args.Term < rf.CurrentTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.CurrentTerm
 		return
 	}
 
-	// 2) Viu termo maior?
+	// 2) Se viu termo maior, atualiza.
 	if args.Term > rf.CurrentTerm {
-		rf.becomeFollowerLocked(args.Term) // atualiza termo, limpa voto e vira follower
+		rf.becomeFollowerLocked(args.Term)
 	}
 
-	// 3) Concede voto se ainda não votou no termo ou já votou no próprio candidato
-	//    e se o log do candidato é pelo menos tão atualizado quanto o meu.
+	// Configure o termo de resposta SEMPRE com o termo mais atualizado
+	reply.Term = rf.CurrentTerm
+	reply.VoteGranted = false
+
+	// 3) Verifica se pode conceder o voto
 	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId) && rf.candidateUpToDateLocked(args.LastLogIndex, args.LastLogTerm) {
-		rf.VotedFor = args.CandidateId // concede voto
+		rf.VotedFor = args.CandidateId
 		reply.VoteGranted = true
-		reply.Term = rf.CurrentTerm // atualiza termo no reply
-		// Concedeu voto → reseta timeout para evitar eleições desnecessárias.
 		rf.resetElectionTimerLocked()
 	}
 }
@@ -196,32 +199,27 @@ func (rf *Raft) resetElectionTimerLocked() {
 // Também dispara e mantém heartbeats quando torna-se líder.
 func (rf *Raft) electionLoop() {
 	rf.mu.Lock()
-	rf.resetElectionTimerLocked() // inicia timer de eleição
+	rf.resetElectionTimerLocked()
 	rf.mu.Unlock()
 
 	for {
-		// Bloqueia até timeout da eleição.
 		<-rf.ElectionTimer.C
-		if atomic.LoadInt32(&rf.dead) == 1 { // morto
+		if atomic.LoadInt32(&rf.dead) == 1 {
 			return
 		}
 
-		// Se não é líder, vira candidato e tenta eleição.
 		rf.mu.Lock()
-		if rf.State != StateLeader {
-			rf.startElectionLocked()
-			// Ao terminar startElectionLocked, o nó pode ter virado líder ou follower.
-			// Em qualquer caso reagenda o próximo timeout.
-			rf.resetElectionTimerLocked()
-		} else {
-			// Se já é líder, apenas reagenda o timer para não disparar eleições enquanto líder.
-			rf.resetElectionTimerLocked()
-		}
+		// Sempre dispara eleição no timeout.
+		rf.startElectionLocked()
+		rf.resetElectionTimerLocked()
 		rf.mu.Unlock()
 	}
 }
 
 // Dispara uma rodada de eleição: incrementa termo, vota em si, pede votos e conta maioria.
+// Deve ser chamada com rf.mu travado.
+// Dispara uma rodada de eleição de forma não-bloqueante.
+// Dispara uma rodada de eleição de forma não-bloqueante.
 // Deve ser chamada com rf.mu travado.
 func (rf *Raft) startElectionLocked() {
 	termStarted := rf.CurrentTerm + 1
@@ -229,18 +227,11 @@ func (rf *Raft) startElectionLocked() {
 	rf.State = StateCandidate
 	rf.VotedFor = rf.me
 
-	// Dados do meu log para a regra de “log atualizado”.
 	lastIdx, lastTerm := rf.lastIndexAndTermLocked()
-	// O que seria o lastIdx e lastTerm do candidato?
-	// lastIdx: índice do último log (len(rf.Log)-1)
-	// lastTerm: termo do último log (rf.Log[lastIdx].Term)
-
-	votes := 1               // voto em si
-	nPeers := len(rf.peers)  // número total de peers (incluindo o próprio)
-	majority := nPeers/2 + 1 // maioria simples
-
-	// Copia valores imutáveis para usar fora do lock.
-	me := rf.me // O que é rf.me? É o índice deste peer na lista de peers.
+	me := rf.me
+	votes := 1 // voto em si mesmo
+	nPeers := len(rf.peers)
+	majority := nPeers/2 + 1
 
 	args := &RequestVoteArgs{
 		Term:         termStarted,
@@ -249,66 +240,36 @@ func (rf *Raft) startElectionLocked() {
 		LastLogTerm:  lastTerm,
 	}
 
-	// Envia RequestVote em paralelo.
-	rf.mu.Unlock()
-	var wg sync.WaitGroup               // para aguardar todas as goroutines
-	voteCh := make(chan bool, nPeers-1) // canal para votos recebidos
-	termCh := make(chan int, nPeers-1)  // canal para termos maiores recebidos
-
-	// Envia RequestVote para todos os outros peers.
 	for i := 0; i < nPeers; i++ {
-		// pula si mesmo
 		if i == me {
 			continue
 		}
-		// dispara goroutine para enviar RPC
-		// O que é wg, e porque eu Adiciono 1 nele?
-		// wg é um WaitGroup que usamos para esperar que todas as goroutines terminem antes de prosseguir.
-		// Adicionamos 1 para cada goroutine que iniciamos, para que possamos esperar por todas elas mais tarde.
-		wg.Add(1)
-		// dispara a goroutine para o peer i, porque cada peer deve ser tratado de forma independente.
 		go func(peer int) {
-			defer wg.Done()            // sinaliza que esta goroutine terminou ao sair
-			var reply RequestVoteReply // estrutura para armazenar a resposta
-
-			// Se a RPC for bem-sucedida, envia o resultado para os canais apropriados.
+			var reply RequestVoteReply
 			if rf.sendRequestVote(peer, args, &reply) {
-				termCh <- reply.Term        // envia termo recebido
-				voteCh <- reply.VoteGranted // envia voto recebido
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+
+				// Se o estado mudou (ex: recebeu heartbeat e virou follower) ou o termo mudou, aborta.
+				if rf.State != StateCandidate || rf.CurrentTerm != termStarted {
+					return
+				}
+
+				if reply.Term > rf.CurrentTerm {
+					rf.becomeFollowerLocked(reply.Term)
+					return
+				}
+
+				if reply.VoteGranted {
+					votes++
+					if votes == majority {
+						// Atingiu maioria: vira líder e inicia heartbeats imediatamente.
+						rf.State = StateLeader
+						go rf.heartbeatLoop(termStarted)
+					}
+				}
 			}
-		}(i) // passa i como argumento para evitar captura de variável
-	}
-	wg.Wait() // aguarda todas as goroutines terminarem
-	close(voteCh)
-	close(termCh)
-	rf.mu.Lock()
-
-	// Se durante as RPCs alguém nos informou termo maior, atualiza e recua para follower.
-	for t := range termCh {
-		if t > rf.CurrentTerm {
-			rf.becomeFollowerLocked(t) // atualiza termo e vira follower, pq atualizar o termo?
-			// Porque se outro nó tem um termo maior, significa que
-			// ele está mais atualizado
-		}
-	}
-
-	// Se já não é mais candidato (porque recebeu heartbeat ou termo maior), aborta.
-	if rf.State != StateCandidate || rf.CurrentTerm != termStarted {
-		return
-	}
-
-	// Soma votos recebidos nesta rodada.
-	for v := range voteCh {
-		if v {
-			votes++
-		}
-	}
-
-	// Ganhou?
-	if votes >= majority {
-		rf.State = StateLeader
-		// Como líder, começa a enviar heartbeats periódicos.
-		go rf.heartbeatLoop(termStarted)
+		}(i)
 	}
 }
 
@@ -321,13 +282,11 @@ func (rf *Raft) heartbeatLoop(leaderTerm int) {
 			return
 		}
 		rf.mu.Lock()
-		// Se mudou de estado ou termo, para heartbeats.
 		if rf.State != StateLeader || rf.CurrentTerm != leaderTerm {
 			rf.mu.Unlock()
 			return
 		}
-		// Envia um heartbeat para todos os peers.
-		rf.sendHeartbeatsLocked()
+		rf.sendHeartbeatsLocked() // <--- Apenas chamada direta, sem 'if' ou ':='
 		rf.mu.Unlock()
 
 		<-t.C
@@ -335,48 +294,35 @@ func (rf *Raft) heartbeatLoop(leaderTerm int) {
 }
 
 // Envia heartbeats (AppendEntries com Entries vazias). Reage a termos maiores nas respostas.
+// retorna quantos seguidores responderam no MESMO termo atual
+// Envia heartbeats para todos os peers de forma não-bloqueante.
+// Deve ser chamada com rf.mu travado.
 func (rf *Raft) sendHeartbeatsLocked() {
-	n := len(rf.peers)
 	me := rf.me
 	args := &AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderId:     me,
-		PrevLogIndex: 0,
-		PrevLogTerm:  0,
-		Entries:      nil,
+		PrevLogIndex: 0,   // Simplificação para 2A
+		PrevLogTerm:  0,   // Simplificação para 2A
+		Entries:      nil, // Heartbeat
 		LeaderCommit: rf.CommitIndex,
 	}
-	currTerm := rf.CurrentTerm
 
-	rf.mu.Unlock()
-	var wg sync.WaitGroup
-	newTermCh := make(chan int, n-1)
-
-	for i := 0; i < n; i++ {
+	for i := 0; i < len(rf.peers); i++ {
 		if i == me {
 			continue
 		}
-		wg.Add(1)
 		go func(peer int) {
-			defer wg.Done()
 			var reply AppendEntriesReply
-			ok := rf.peers[peer].Call("Raft.AppendEntries", args, &reply)
-			if ok {
-				if reply.Term > currTerm {
-					newTermCh <- reply.Term
+			if rf.peers[peer].Call("Raft.AppendEntries", args, &reply) {
+				rf.mu.Lock()
+				defer rf.mu.Unlock()
+				// Verifica termo maior na resposta
+				if reply.Term > rf.CurrentTerm {
+					rf.becomeFollowerLocked(reply.Term)
 				}
 			}
 		}(i)
-	}
-	wg.Wait()
-	close(newTermCh)
-	rf.mu.Lock()
-
-	// Se alguém respondeu com termo maior, atualiza e recua a follower.
-	for nt := range newTermCh {
-		if nt > rf.CurrentTerm {
-			rf.becomeFollowerLocked(nt)
-		}
 	}
 }
 
@@ -435,8 +381,7 @@ func (rf *Raft) Kill() {
 
 // Criação de um novo peer Raft. Deve retornar rápido e iniciar goroutines de fundo.
 func Make(peers []*labrpc.ClientEnd, me int, persister *Persister, applyCh chan ApplyMsg) *Raft {
-	// Semente aleatória para evitar timeouts iguais em todos os nós.
-	rand.Seed(time.Now().UnixNano())
+	seedOnce.Do(func() { rand.Seed(time.Now().UnixNano()) }) // <-- semear uma vez só
 
 	rf := &Raft{
 		peers:     peers,
